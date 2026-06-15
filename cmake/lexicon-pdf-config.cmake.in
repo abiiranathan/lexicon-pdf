@@ -1,0 +1,26 @@
+@PACKAGE_INIT@
+
+# lexicon-pdf-config.cmake
+# Provides the lexicon::pdf imported target.
+#
+# Usage in a consumer's CMakeLists.txt:
+#
+#   find_package(lexicon-pdf REQUIRED)
+#   target_link_libraries(my_app PRIVATE lexicon::pdf)
+
+include(CMakeFindDependencyMacro)
+
+# PDFium is a private dependency (linked into the static archive or the
+# shared library's soname), but consumers building against the static
+# library need to link it themselves.
+find_library(_lexicon_pdf_pdfium pdfium
+    HINTS /usr/local/lib /usr/lib
+)
+if(NOT _lexicon_pdf_pdfium)
+    message(WARNING "lexicon-pdf: could not locate libpdfium — consumers \
+may need to link it manually.")
+endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/lexicon-pdf-targets.cmake")
+
+check_required_components(lexicon-pdf)

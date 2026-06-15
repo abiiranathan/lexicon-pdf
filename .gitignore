@@ -1,0 +1,8 @@
+lpdf/lpdf
+*.so
+*.a
+build
+.cache
+*.png
+*.jpg
+*.jpeg
