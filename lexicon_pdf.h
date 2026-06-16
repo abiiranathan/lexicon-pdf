@@ -299,6 +299,42 @@ pdf_status_t pdf_text_utf8_buf(const pdf_text_t* text, char* buf, size_t cap, si
 pdf_status_t pdf_text_utf8(const pdf_text_t* text, char** out);
 
 /* -------------------------------------------------------------------------
+ * Text character boxes (for client-side selectable text overlays)
+ * ---------------------------------------------------------------------- */
+
+/**
+ * Bounding box and codepoint for a single character on a text page.
+ * Coordinates are in PDF page space (points, origin bottom-left), matching
+ * pdf_page_width()/pdf_page_height(). The caller maps these to pixel space
+ * using the same scale factor passed to pdf_page_render().
+ */
+typedef struct {
+    float left;         /**< Left edge, in PDF points.                     */
+    float right;        /**< Right edge, in PDF points.                    */
+    float bottom;       /**< Bottom edge, in PDF points.                   */
+    float top;          /**< Top edge, in PDF points.                      */
+    uint32_t codepoint; /**< Unicode codepoint of the character.           */
+} pdf_char_box_t;
+
+/**
+ * Extracts per-character bounding boxes for a range of characters on a text
+ * page. Zero allocation; writes directly into the caller-supplied array.
+ *
+ * Characters with a degenerate box (e.g. whitespace, on some PDFs) are
+ * still written with whatever PDFium reports; callers that only want
+ * visible glyphs should skip entries where left == right and bottom == top.
+ *
+ * @param text         Initialised text handle.
+ * @param start_index  Zero-based index of the first character (must be
+ *                      < pdf_text_char_count(text)).
+ * @param count        Number of characters to extract.
+ * @param[out] boxes   Destination array; must hold at least count entries.
+ * @return             PDF_OK on success, PDF_ERR_PARAM if text/boxes is
+ *                      NULL or the requested range is out of bounds.
+ */
+pdf_status_t pdf_text_char_boxes(const pdf_text_t* text, int start_index, int count, pdf_char_box_t* boxes);
+
+/* -------------------------------------------------------------------------
  * Image output
  * ---------------------------------------------------------------------- */
 

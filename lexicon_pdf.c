@@ -610,6 +610,37 @@ pdf_status_t pdf_text_utf8(const pdf_text_t* text, char** out) {
     return PDF_OK; /* callers of the heap API don't need to know about truncation */
 }
 
+pdf_status_t pdf_text_char_boxes(const pdf_text_t* text, int start_index, int count, pdf_char_box_t* boxes) {
+    if (text == NULL || text->_handle == NULL || boxes == NULL) return PDF_ERR_PARAM;
+    if (start_index < 0 || count <= 0) return PDF_ERR_PARAM;
+    if (start_index + count > text->count) return PDF_ERR_PARAM;
+
+    FPDF_TEXTPAGE handle = (FPDF_TEXTPAGE)text->_handle;
+
+    PDF_LOCK();
+    for (int i = 0; i < count; i++) {
+        int idx = start_index + i;
+        double left = 0.0, right = 0.0, bottom = 0.0, top = 0.0;
+
+        /* FPDFText_GetCharBox returns 0 on failure; leave a zeroed box
+         * for that character rather than aborting the whole batch, so
+         * one malformed glyph doesn't cost the caller the rest of the
+         * page's layout data. */
+        if (!FPDFText_GetCharBox(handle, idx, &left, &right, &bottom, &top)) { left = right = bottom = top = 0.0; }
+
+        boxes[i] = (pdf_char_box_t){
+            .left = (float)left,
+            .right = (float)right,
+            .bottom = (float)bottom,
+            .top = (float)top,
+            .codepoint = (uint32_t)FPDFText_GetUnicode(handle, idx),
+        };
+    }
+    PDF_UNLOCK();
+
+    return PDF_OK;
+}
+
 /* -------------------------------------------------------------------------
  * Image encoding helpers
  * ---------------------------------------------------------------------- */
