@@ -1,8 +1,13 @@
 cmake_minimum_required(VERSION 3.20)
 
+# Emit build/compile_commands.json so editors (clangd, VS Code C/C++) can
+# resolve third-party headers (poppler/cairo/glib live outside the default
+# include path and are only known via pkg-config).
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
 project(lexicon-pdf
-    VERSION      1.0.0
-    DESCRIPTION  "PDFium-backed PDF processing library"
+    VERSION      1.1.0
+    DESCRIPTION  "Poppler-backed PDF processing library"
     HOMEPAGE_URL "https://github.com/abiiranathan/lexicon"
     LANGUAGES    C
 )
@@ -19,17 +24,15 @@ option(BUILD_SHARED_LIBS
     OFF
 )
 
+option(LEXICON_PDF_BUILD_TESTS
+    "Build the lexicon-pdf regression suite (run with `make test` / ctest)"
+    ON
+)
+
 # ── Dependencies ──────────────────────────────────────────────────────────────
 
-find_library(PDFIUM_LIB pdfium
-    REQUIRED
-    HINTS /usr/local/lib /usr/lib
-)
-
-find_path(PDFIUM_INCLUDE fpdfview.h
-    REQUIRED
-    HINTS /usr/local/include /usr/include
-)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(Poppler REQUIRED IMPORTED_TARGET poppler-glib)
 
 # ── Library target ────────────────────────────────────────────────────────────
 
@@ -54,23 +57,21 @@ set_target_properties(lexicon-pdf PROPERTIES
     EXPORT_NAME         pdf
 )
 
-# pdfium headers are only needed when compiling our .c file.
-target_include_directories(lexicon-pdf
+# poppler-glib headers are only needed when compiling our .c file.
+target_link_libraries(lexicon-pdf
     PRIVATE
-        ${PDFIUM_INCLUDE}
-    # Expose our own public header directory to consumers.
+        PkgConfig::Poppler
+)
+
+# Expose our own public header directory to consumers.
+target_include_directories(lexicon-pdf
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
         $<INSTALL_INTERFACE:include>
 )
 
-target_link_libraries(lexicon-pdf
-    PRIVATE
-        ${PDFIUM_LIB}
-)
-
 target_compile_definitions(lexicon-pdf
-    # _GNU_SOURCE unlocks POSIX extensions (iconv, etc.) for consumers too.
+    # _GNU_SOURCE unlocks POSIX extensions for consumers too.
     PUBLIC  _GNU_SOURCE
 )
 
@@ -78,6 +79,38 @@ target_compile_options(lexicon-pdf PRIVATE
     -Wall -Wextra -Wpedantic
     -Wno-unused-parameter
 )
+
+# ── Regression suite (`make test` / ctest) ────────────────────────────────────
+
+if(LEXICON_PDF_BUILD_TESTS)
+    include(CTest)
+
+    add_executable(lexicon-pdf-tests
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_pdf.c
+    )
+
+    set_target_properties(lexicon-pdf-tests PROPERTIES
+        C_STANDARD          11
+        C_STANDARD_REQUIRED ON
+        C_EXTENSIONS        OFF
+    )
+
+    # The test includes "lexicon_pdf.h" from the source root and links the
+    # in-tree library (poppler link flags propagate from it automatically).
+    target_include_directories(lexicon-pdf-tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+
+    target_link_libraries(lexicon-pdf-tests PRIVATE
+        lexicon::pdf
+    )
+
+    target_compile_options(lexicon-pdf-tests PRIVATE
+        -Wall -Wextra -Wpedantic
+    )
+
+    add_test(NAME pdf-api COMMAND lexicon-pdf-tests)
+endif()
 
 # ── Install ───────────────────────────────────────────────────────────────────
 
@@ -125,10 +158,6 @@ if(LEXICON_PDF_INSTALL)
     )
 
     # -- pkg-config -----------------------------------------------------------
-
-    # Resolve the pdfium library name for the .pc Libs.private field.
-    get_filename_component(PDFIUM_LIB_NAME "${PDFIUM_LIB}" NAME_WE)
-    string(REGEX REPLACE "^lib" "" PDFIUM_LIB_NAME "${PDFIUM_LIB_NAME}")
 
     configure_file(
         "${CMAKE_CURRENT_SOURCE_DIR}/cmake/lexicon-pdf.pc.in"

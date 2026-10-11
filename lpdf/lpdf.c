@@ -24,7 +24,7 @@
  *   implementations) since MSVC's CRT does not provide it.
  */
 
-#include <lexicon/lexicon_pdf.h>
+#include "../lexicon_pdf.h"
 
 #include <errno.h>   /* errno, strerror                                  */
 #include <getopt.h>  /* getopt_long, struct option, optarg, optind       */
@@ -63,7 +63,9 @@
  *         value is less than 1.
  */
 static int parse_page(const char* s) {
-    if (s == NULL) { return -1; }
+    if (s == NULL) {
+        return -1;
+    }
 
     char* end = NULL;
     long v = strtol(s, &end, 10);
@@ -82,7 +84,9 @@ static int parse_page(const char* s) {
  *         malformed, or non-positive.
  */
 static float parse_scale(const char* s) {
-    if (s == NULL) { return DEFAULT_SCALE; }
+    if (s == NULL) {
+        return DEFAULT_SCALE;
+    }
 
     char* end = NULL;
     float v = strtof(s, &end);
@@ -114,7 +118,9 @@ static image_format_t parse_image_format(const char* s) {
     if (s != NULL && (strcmp(s, "jpg") == 0 || strcmp(s, "jpeg") == 0)) {
         return (image_format_t){.format = PDF_IMAGE_JPEG, .extension = "jpg"};
     }
-    if (s != NULL && strcmp(s, "png") != 0) { fprintf(stderr, "warning: unknown format '%s', using 'png'\n", s); }
+    if (s != NULL && strcmp(s, "png") != 0) {
+        fprintf(stderr, "warning: unknown format '%s', using 'png'\n", s);
+    }
     return (image_format_t){.format = PDF_IMAGE_PNG, .extension = "png"};
 }
 
@@ -135,14 +141,18 @@ static void derive_basename_stem(const char* pdf_path, char* out, size_t out_siz
 #if defined(_WIN32)
     /* Windows accepts both '/' and '\\' as path separators. */
     const char* base_win = strrchr(pdf_path, '\\');
-    if (base_win != NULL && (base == NULL || base_win > base)) { base = base_win; }
+    if (base_win != NULL && (base == NULL || base_win > base)) {
+        base = base_win;
+    }
 #endif
     base = (base != NULL) ? base + 1 : pdf_path;
 
     size_t len = strlen(base);
     static const char pdf_ext[] = ".pdf";
     const size_t pdf_ext_len = sizeof(pdf_ext) - 1u;
-    if (len > pdf_ext_len && strcmp(base + len - pdf_ext_len, pdf_ext) == 0) { len -= pdf_ext_len; }
+    if (len > pdf_ext_len && strcmp(base + len - pdf_ext_len, pdf_ext) == 0) {
+        len -= pdf_ext_len;
+    }
 
     snprintf(out, out_size, "%.*s", (int)len, base);
 }
@@ -158,9 +168,12 @@ static void derive_basename_stem(const char* pdf_path, char* out, size_t out_siz
  * @return ::PDF_OK on success, or the error status returned by
  *         pdf_document_open() on failure.
  */
-static pdf_status_t open_document_or_warn(const char* filename, const char* password, pdf_document_t* doc) {
+static pdf_status_t open_document_or_warn(const char* filename, const char* password,
+                                          pdf_document_t* doc) {
     pdf_status_t st = pdf_document_open(doc, filename, password);
-    if (st != PDF_OK) { fprintf(stderr, "error: cannot open '%s': %s\n", filename, pdf_strerror(st)); }
+    if (st != PDF_OK) {
+        fprintf(stderr, "error: cannot open '%s': %s\n", filename, pdf_strerror(st));
+    }
     return st;
 }
 
@@ -174,8 +187,8 @@ static pdf_status_t open_document_or_warn(const char* filename, const char* pass
  */
 static bool page_index_in_range(int page_index, int page_count) {
     if (page_index < 0 || page_index >= page_count) {
-        fprintf(stderr, "error: page %d is out of range (document has %d page%s)\n", page_index + 1, page_count,
-                (page_count == 1) ? "" : "s");
+        fprintf(stderr, "error: page %d is out of range (document has %d page%s)\n", page_index + 1,
+                page_count, (page_count == 1) ? "" : "s");
         return false;
     }
     return true;
@@ -246,7 +259,9 @@ static int cmd_info(int argc, char* argv[]) {
     const char* filename = argv[optind];
 
     pdf_document_t doc = {0};
-    if (open_document_or_warn(filename, password, &doc) != PDF_OK) { return EXIT_FAILURE; }
+    if (open_document_or_warn(filename, password, &doc) != PDF_OK) {
+        return EXIT_FAILURE;
+    }
 
     int exit_code = EXIT_SUCCESS;
     char buf[META_BUF_SIZE];
@@ -256,8 +271,9 @@ static int cmd_info(int argc, char* argv[]) {
         pdf_meta_field_t field; /**< Library field identifier.   */
         const char* label;      /**< Human-readable column label. */
     } fields[] = {
-        {PDF_META_TITLE, "Title"},       {PDF_META_AUTHOR, "Author"},   {PDF_META_SUBJECT, "Subject"},
-        {PDF_META_KEYWORDS, "Keywords"}, {PDF_META_CREATOR, "Creator"}, {PDF_META_PRODUCER, "Producer"},
+        {PDF_META_TITLE, "Title"},     {PDF_META_AUTHOR, "Author"},
+        {PDF_META_SUBJECT, "Subject"}, {PDF_META_KEYWORDS, "Keywords"},
+        {PDF_META_CREATOR, "Creator"}, {PDF_META_PRODUCER, "Producer"},
     };
 
     printf("File    : %s\n", filename);
@@ -267,7 +283,9 @@ static int cmd_info(int argc, char* argv[]) {
         buf[0] = '\0';
         pdf_document_metadata(&doc, fields[i].field, buf, sizeof(buf));
         /* Skip fields the document left empty. */
-        if (buf[0] != '\0') { printf("%-9s: %s\n", fields[i].label, buf); }
+        if (buf[0] != '\0') {
+            printf("%-9s: %s\n", fields[i].label, buf);
+        }
     }
 
     /* Per-page dimensions. */
@@ -282,9 +300,9 @@ static int cmd_info(int argc, char* argv[]) {
             exit_code = EXIT_FAILURE;
             continue;
         }
-        printf("  page %3d: %.1f x %.1f pt  (%.2f x %.2f in)\n", i + 1, (double)pdf_page_width(&page),
-               (double)pdf_page_height(&page), (double)pdf_page_width(&page) / 72.0,
-               (double)pdf_page_height(&page) / 72.0);
+        printf("  page %3d: %.1f x %.1f pt  (%.2f x %.2f in)\n", i + 1,
+               (double)pdf_page_width(&page), (double)pdf_page_height(&page),
+               (double)pdf_page_width(&page) / 72.0, (double)pdf_page_height(&page) / 72.0);
         pdf_page_close(&page);
     }
 
@@ -372,11 +390,15 @@ static int cmd_text(int argc, char* argv[]) {
     int single_page = -1;
     if (page_str != NULL) {
         single_page = parse_page(page_str);
-        if (single_page < 0) { return EXIT_FAILURE; }
+        if (single_page < 0) {
+            return EXIT_FAILURE;
+        }
     }
 
     pdf_document_t doc = {0};
-    if (open_document_or_warn(filename, password, &doc) != PDF_OK) { return EXIT_FAILURE; }
+    if (open_document_or_warn(filename, password, &doc) != PDF_OK) {
+        return EXIT_FAILURE;
+    }
 
     int page_count = pdf_document_page_count(&doc);
     int first = (single_page >= 0) ? single_page : 0;
@@ -420,11 +442,14 @@ static int cmd_text(int argc, char* argv[]) {
         char* utf8 = NULL;
         st = pdf_text_utf8(text, &utf8);
         if (st != PDF_OK) {
-            fprintf(stderr, "warning: text extraction failed on page %d: %s\n", i + 1, pdf_strerror(st));
+            fprintf(stderr, "warning: text extraction failed on page %d: %s\n", i + 1,
+                    pdf_strerror(st));
             exit_code = EXIT_FAILURE;
         } else {
             /* Print a page separator when dumping multiple pages. */
-            if (first != last) { fprintf(out, "\n--- Page %d ---\n\n", i + 1); }
+            if (first != last) {
+                fprintf(out, "\n--- Page %d ---\n\n", i + 1);
+            }
             fputs(utf8, out);
             fputc('\n', out);
             free(utf8);
@@ -538,7 +563,9 @@ static int cmd_render(int argc, char* argv[]) {
     int single = -1;
     if (page_str != NULL) {
         single = parse_page(page_str);
-        if (single < 0) { return EXIT_FAILURE; }
+        if (single < 0) {
+            return EXIT_FAILURE;
+        }
     }
 
     image_format_t img = parse_image_format(format_str);
@@ -557,7 +584,9 @@ static int cmd_render(int argc, char* argv[]) {
     }
 
     pdf_document_t doc = {0};
-    if (open_document_or_warn(filename, password, &doc) != PDF_OK) { return EXIT_FAILURE; }
+    if (open_document_or_warn(filename, password, &doc) != PDF_OK) {
+        return EXIT_FAILURE;
+    }
 
     int page_count = pdf_document_page_count(&doc);
     int first = (single >= 0) ? single : 0;
@@ -568,8 +597,8 @@ static int cmd_render(int argc, char* argv[]) {
         return EXIT_FAILURE;
     }
 
-    printf("Rendering %d page(s) at scale %.1fx (%d DPI) as %s...\n", last - first + 1, (double)scale,
-           (int)(72.0f * scale), img.extension);
+    printf("Rendering %d page(s) at scale %.1fx (%d DPI) as %s...\n", last - first + 1,
+           (double)scale, (int)(72.0f * scale), img.extension);
 
     int exit_code = EXIT_SUCCESS;
     for (int i = first; i <= last; i++) {
@@ -592,7 +621,8 @@ static int cmd_render(int argc, char* argv[]) {
 
         /* PREFIX_MAX guarantees this fits within PATH_BUF_SIZE. */
         char out_path[PATH_BUF_SIZE] = {0};
-        snprintf(out_path, sizeof(out_path), "%.*s_page%03d.%s", (int)PREFIX_MAX, prefix, i + 1, img.extension);
+        snprintf(out_path, sizeof(out_path), "%.*s_page%03d.%s", (int)PREFIX_MAX, prefix, i + 1,
+                 img.extension);
 
         pdf_status_t wst = pdf_bitmap_write(&bmp, out_path, img.format, write_quality);
         if (wst == PDF_OK) {
@@ -693,10 +723,14 @@ static int cmd_extract(int argc, char* argv[]) {
     const char* filename = argv[optind];
 
     int page_idx = parse_page(page_str);
-    if (page_idx < 0) { return EXIT_FAILURE; }
+    if (page_idx < 0) {
+        return EXIT_FAILURE;
+    }
 
     pdf_document_t doc = {0};
-    if (open_document_or_warn(filename, password, &doc) != PDF_OK) { return EXIT_FAILURE; }
+    if (open_document_or_warn(filename, password, &doc) != PDF_OK) {
+        return EXIT_FAILURE;
+    }
 
     int exit_code = EXIT_SUCCESS;
     pdf_page_t page = {0};
@@ -749,7 +783,8 @@ static int cmd_extract(int argc, char* argv[]) {
 
     fputs(utf8, f);
     fclose(f);
-    printf("Page %d text extracted to '%s' (%d chars)\n", page_idx + 1, out_path, pdf_text_char_count(text));
+    printf("Page %d text extracted to '%s' (%d chars)\n", page_idx + 1, out_path,
+           pdf_text_char_count(text));
 
 out_free_utf8:
     free(utf8);

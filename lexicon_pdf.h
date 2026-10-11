@@ -21,7 +21,7 @@ typedef enum {
     PDF_ERR_RENDER = 7,   /**< Bitmap creation or rendering failed.      */
     PDF_ERR_TEXT = 8,     /**< Text page load failed.                    */
     PDF_ERR_TRUNC = 9,    /**< Output truncated; buffer too small.       */
-    PDF_ERR_UNKNOWN = 10, /**< PDFium reported an unclassified error.    */
+    PDF_ERR_UNKNOWN = 10, /**< Backend reported an unclassified error.   */
 } pdf_status_t;
 
 /**
@@ -64,7 +64,7 @@ void pdf_bitmap_free(pdf_bitmap_t* bmp);
  *
  */
 typedef struct pdf_document {
-    void* _handle; /**< Internal PDFium handle. Do not access directly.  */
+    void* _handle; /**< Internal backend handle. Do not access directly.  */
 } pdf_document_t;
 
 /**
@@ -74,7 +74,7 @@ typedef struct pdf_document {
  * release resources with pdf_page_close().
  */
 typedef struct pdf_page {
-    void* _handle; /**< Internal PDFium handle. Do not access directly.  */
+    void* _handle; /**< Internal backend handle. Do not access directly.  */
 } pdf_page_t;
 
 /**
@@ -87,7 +87,7 @@ typedef struct pdf_page {
  * a pointer; release with pdf_text_close().
  */
 typedef struct pdf_text {
-    void* _handle; /**< Internal PDFium handle. Do not access directly.  */
+    void* _handle; /**< Internal backend handle. Do not access directly.  */
     int count;     /**< Cached character count.                          */
 } pdf_text_t;
 
@@ -96,13 +96,13 @@ typedef struct pdf_text {
  * ---------------------------------------------------------------------- */
 
 /**
- * Initialises the PDFium library.
+ * Initialises the PDF backend library.
  * Must be called exactly once before any other pdf_* function.
  */
 void pdf_library_init(void);
 
 /**
- * Tears down the PDFium library and releases all internal resources.
+ * Tears down the PDF backend library and releases all internal resources.
  * Must be called exactly once after all pdf_* handles have been closed.
  */
 void pdf_library_destroy(void);
@@ -321,7 +321,7 @@ typedef struct {
  * page. Zero allocation; writes directly into the caller-supplied array.
  *
  * Characters with a degenerate box (e.g. whitespace, on some PDFs) are
- * still written with whatever PDFium reports; callers that only want
+ * still written with whatever the backend reports; callers that only want
  * visible glyphs should skip entries where left == right and bottom == top.
  *
  * @param text         Initialised text handle.

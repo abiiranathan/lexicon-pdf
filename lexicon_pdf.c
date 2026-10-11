@@ -1,30 +1,30 @@
 /**
  * @file lexicon_pdf.c
- * @brief PDFium-backed PDF processing library — optimised implementation.
+ * @brief Poppler-backed PDF processing library — optimised implementation.
  *
- * Thread-safety: PDFium internals are serialised with a global mutex.
- * iconv is used outside the lock (safe — each thread has its own cd).
+ * Thread-safety: poppler object access is serialised with a global mutex.
+ * Cached text extraction results are read-only after pdf_text_init(), so
+ * pdf_text_utf8_buf(), pdf_text_utf8(), pdf_text_char_count() and
+ * pdf_text_char_boxes() are lock-free.
  */
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
 
-#include <errno.h>     /* errno, EILSEQ, E2BIG               */
-#include <fpdf_doc.h>  /* FPDF_GetMetaText                   */
-#include <fpdf_text.h> /* FPDFText_LoadPage, FPDFText_GetText */
-#include <fpdfview.h>  /* FPDF_InitLibrary, FPDF_LoadDocument */
-#include <iconv.h>     /* iconv_t, iconv_open, iconv, iconv_close */
-#include <limits.h>    /* INT_MAX                             */
-#include <pthread.h>   /* pthread_mutex_t                     */
-#include <stdint.h>    /* uint8_t, uint16_t                   */
-#include <stdio.h>     /* fprintf, stderr                     */
-#include <stdlib.h>    /* malloc, free                        */
-#include <string.h>    /* memset, memcpy                      */
+#include <cairo.h>
+#include <glib.h>
+#include <poppler.h>
+#include <pthread.h> /* pthread_mutex_t                     */
+#include <stdbool.h> /* bool                                */
+#include <stdint.h>  /* uint8_t                             */
+#include <stdio.h>   /* fprintf, stderr                     */
+#include <stdlib.h>  /* malloc, free                        */
+#include <string.h>  /* memcpy, strlen                      */
 
 #include "lexicon_pdf.h"
 
 /* -------------------------------------------------------------------------
- * PDFium global mutex
+ * Global mutex (serialises poppler object access)
  * ---------------------------------------------------------------------- */
 
 static pthread_mutex_t g_pdf_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -33,53 +33,52 @@ static pthread_mutex_t g_pdf_mutex = PTHREAD_MUTEX_INITIALIZER;
 #define PDF_UNLOCK() pthread_mutex_unlock(&g_pdf_mutex)
 
 /* -------------------------------------------------------------------------
- * Thread-local iconv descriptor (UTF-16LE → UTF-8)
- *
- * Opened lazily on first use per thread; never explicitly closed (the OS
- * reclaims it on thread exit).  This eliminates one iconv_open/iconv_close
- * pair per page across all worker threads.
+ * Internal handle wrappers
  * ---------------------------------------------------------------------- */
 
-static _Thread_local iconv_t tl_iconv_cd = (iconv_t)-1;
-
-/** Returns the thread-local iconv descriptor, opening it if necessary. */
-static iconv_t get_iconv_cd(void) {
-    if (tl_iconv_cd == (iconv_t)-1) {
-        tl_iconv_cd = iconv_open("UTF-8", "UTF-16LE");
-        /* Failure here is catastrophic; we can only propagate NULL upward. */
-    }
-    return tl_iconv_cd;
-}
-
-/* -------------------------------------------------------------------------
- * Threshold for stack vs. heap UTF-16 scratch buffer.
+/**
+ * Document internals.
  *
- * A page with <= MAX_UTF16_STACK_CHARS characters uses an 8 KB stack
- * buffer.  Beyond that, a heap allocation is made and freed immediately.
- * Most PDF pages have < 3000 characters.
- * ---------------------------------------------------------------------- */
+ * PopplerDocument is a GObject (refcounted). For memory-backed documents
+ * the GBytes references the caller's buffer without copying
+ * (g_bytes_new_static), so it must stay alive until the document is
+ * destroyed — matching the public API contract that the buffer must remain
+ * valid until pdf_document_close().
+ */
+typedef struct {
+    PopplerDocument* doc;
+    GBytes* bytes; /* non-NULL only for pdf_document_open_mem(); else NULL */
+} doc_inner_t;
 
-#define MAX_UTF16_STACK_CHARS 4096
+/**
+ * Cached text-extraction results.
+ *
+ * Poppler has no persistent text-page object: poppler_page_get_text() and
+ * poppler_page_get_text_layout() each allocate fresh results. We snapshot
+ * both once in pdf_text_init() so the hot-path accessors are pure memcpy
+ * (and lock-free). n_rects == nchars is guaranteed by construction; if the
+ * backend ever disagrees we fall back to degenerate boxes.
+ */
+typedef struct {
+    char* utf8;            /* NUL-terminated UTF-8 page text (owned).      */
+    pdf_char_box_t* boxes; /* count entries in bottom-left-origin points.  */
+    int count;             /* Unicode character count (g_utf8_strlen).     */
+} text_inner_t;
 
 /* -------------------------------------------------------------------------
  * Error helpers
  * ---------------------------------------------------------------------- */
 
-static pdf_status_t map_pdfium_error(unsigned long err) {
-    switch (err) {
-        case FPDF_ERR_SUCCESS:
-            return PDF_OK;
-        case FPDF_ERR_FILE:
-            return PDF_ERR_FILE;
-        case FPDF_ERR_FORMAT:
-            return PDF_ERR_FORMAT;
-        case FPDF_ERR_PASSWORD:
-            return PDF_ERR_PASSWORD;
-        case FPDF_ERR_PAGE:
-            return PDF_ERR_PAGE;
-        default:
-            return PDF_ERR_UNKNOWN;
+static pdf_status_t map_gerror(const GError* err) {
+    if (err == NULL) return PDF_ERR_UNKNOWN;
+    if (g_error_matches(err, POPPLER_ERROR, POPPLER_ERROR_ENCRYPTED)) return PDF_ERR_PASSWORD;
+    if (err->domain == POPPLER_ERROR) {
+        /* INVALID, BAD_CATALOG, DAMAGED, SIGNING → format problems. */
+        if (err->code == POPPLER_ERROR_OPEN_FILE) return PDF_ERR_FILE;
+        return PDF_ERR_FORMAT;
     }
+    /* G_FILE_ERROR / G_IO_ERROR (e.g. ENOENT from new_from_file). */
+    return PDF_ERR_FILE;
 }
 
 const char* pdf_strerror(pdf_status_t status) {
@@ -105,27 +104,19 @@ const char* pdf_strerror(pdf_status_t status) {
         case PDF_ERR_TRUNC:
             return "output truncated; buffer too small";
         case PDF_ERR_UNKNOWN:
-            return "unknown PDFium error";
+            return "unknown PDF backend error";
         default:
             return "unrecognised error code";
     }
 }
 
 /* -------------------------------------------------------------------------
- * Library lifecycle
+ * Library lifecycle (poppler needs no init; kept as no-ops for API compat)
  * ---------------------------------------------------------------------- */
 
-void pdf_library_init(void) {
-    PDF_LOCK();
-    FPDF_InitLibrary();
-    PDF_UNLOCK();
-}
+void pdf_library_init(void) { /* poppler/glib require no global init since glib 2.36. */ }
 
-void pdf_library_destroy(void) {
-    PDF_LOCK();
-    FPDF_DestroyLibrary();
-    PDF_UNLOCK();
-}
+void pdf_library_destroy(void) { /* No-op. */ }
 
 /* -------------------------------------------------------------------------
  * Bitmap
@@ -138,67 +129,106 @@ void pdf_bitmap_free(pdf_bitmap_t* bmp) {
     bmp->width = bmp->height = bmp->stride = 0;
 }
 
-static pdf_status_t pdf_document_init_mem(pdf_document_t* doc, const void* data, size_t size, const char* password) {
+/* -------------------------------------------------------------------------
+ * Document
+ * ---------------------------------------------------------------------- */
+
+static pdf_status_t pdf_document_init_file(pdf_document_t* doc, const char* filename,
+                                           const char* password) {
+    char* uri = g_filename_to_uri(filename, NULL, NULL);
+    if (uri == NULL) {
+        fprintf(stderr, "pdf_document_init: cannot convert filename '%s' to URI\n", filename);
+        return PDF_ERR_FILE;
+    }
+
+    PDF_LOCK();
+    GError* err = NULL;
+    PopplerDocument* raw = poppler_document_new_from_file(uri, password, &err);
+    PDF_UNLOCK();
+    g_free(uri);
+
+    if (raw == NULL) {
+        pdf_status_t st = map_gerror(err);
+        fprintf(stderr, "pdf_document_init: failed to open '%s': %s\n", filename, pdf_strerror(st));
+        if (err) {
+            fprintf(stderr, "pdf_document_init: backend said: %s\n", err->message);
+            g_error_free(err);
+        }
+        return st;
+    }
+
+    doc_inner_t* inner = malloc(sizeof(*inner));
+    if (inner == NULL) {
+        g_object_unref(raw);
+        return PDF_ERR_NOMEM;
+    }
+    inner->doc = raw;
+    inner->bytes = NULL;
+    doc->_handle = inner;
+    return PDF_OK;
+}
+
+static pdf_status_t pdf_document_init_mem(pdf_document_t* doc, const void* data, size_t size,
+                                          const char* password) {
     if (doc == NULL || data == NULL || size == 0) {
         fprintf(stderr, "pdf_document_init_mem: invalid parameter\n");
         return PDF_ERR_PARAM;
     }
-    if (size > (size_t)INT_MAX) {
-        fprintf(stderr, "pdf_document_init_mem: buffer too large (%zu bytes)\n", size);
-        return PDF_ERR_PARAM;
-    }
+
+    /* Static bytes: no copy, no free — caller buffer must outlive the doc. */
+    GBytes* bytes = g_bytes_new_static(data, size);
+    if (bytes == NULL) return PDF_ERR_NOMEM;
 
     PDF_LOCK();
-    FPDF_DOCUMENT raw = FPDF_LoadMemDocument(data, (int)size, password);
+    GError* err = NULL;
+    PopplerDocument* raw = poppler_document_new_from_bytes(bytes, password, &err);
+    PDF_UNLOCK();
+
     if (raw == NULL) {
-        pdf_status_t st = map_pdfium_error(FPDF_GetLastError());
-        PDF_UNLOCK();
+        pdf_status_t st = map_gerror(err);
         fprintf(stderr, "pdf_document_init_mem: %s\n", pdf_strerror(st));
+        if (err) {
+            fprintf(stderr, "pdf_document_init_mem: backend said: %s\n", err->message);
+            g_error_free(err);
+        }
+        g_bytes_unref(bytes);
         return st;
     }
-    PDF_UNLOCK();
 
-    doc->_handle = raw;
-    return PDF_OK;
-}
-
-static pdf_status_t pdf_document_init(pdf_document_t* doc, const char* filename, const char* password) {
-    PDF_LOCK();
-    FPDF_DOCUMENT raw = FPDF_LoadDocument(filename, password);
-    if (raw == NULL) {
-        pdf_status_t st = map_pdfium_error(FPDF_GetLastError());
-        PDF_UNLOCK();
-        fprintf(stderr, "pdf_document_init: failed to open '%s': %s\n", filename, pdf_strerror(st));
-        return st;
+    doc_inner_t* inner = malloc(sizeof(*inner));
+    if (inner == NULL) {
+        g_object_unref(raw);
+        g_bytes_unref(bytes);
+        return PDF_ERR_NOMEM;
     }
-    PDF_UNLOCK();
-
-    doc->_handle = raw;
+    inner->doc = raw;
+    inner->bytes = bytes; /* keep alive until destroy */
+    doc->_handle = inner;
     return PDF_OK;
 }
 
 void pdf_document_destroy(pdf_document_t* doc) {
     if (doc == NULL || doc->_handle == NULL) return;
+    doc_inner_t* inner = (doc_inner_t*)doc->_handle;
+    /* Unref under lock to serialise against concurrent opens. */
     PDF_LOCK();
-    FPDF_CloseDocument((FPDF_DOCUMENT)doc->_handle);
+    g_object_unref(inner->doc);
     PDF_UNLOCK();
+    if (inner->bytes) g_bytes_unref(inner->bytes);
+    free(inner);
     doc->_handle = NULL;
 }
-
-/* -------------------------------------------------------------------------
- * Document — heap-allocation (legacy / pointer) API
- * ---------------------------------------------------------------------- */
 
 pdf_status_t pdf_document_open(pdf_document_t* doc, const char* filename, const char* password) {
     if (filename == NULL || doc == NULL) {
         fprintf(stderr, "pdf_document_open: NULL parameter\n");
         return PDF_ERR_PARAM;
     }
-
-    return pdf_document_init(doc, filename, password);
+    return pdf_document_init_file(doc, filename, password);
 }
 
-pdf_status_t pdf_document_open_mem(pdf_document_t* doc, const void* data, size_t size, const char* password) {
+pdf_status_t pdf_document_open_mem(pdf_document_t* doc, const void* data, size_t size,
+                                   const char* password) {
     if (data == NULL || size == 0 || doc == NULL) {
         fprintf(stderr, "pdf_document_open_mem: invalid parameter\n");
         return PDF_ERR_PARAM;
@@ -213,164 +243,147 @@ void pdf_document_close(pdf_document_t* doc) {
 
 int pdf_document_page_count(const pdf_document_t* doc) {
     if (doc == NULL || doc->_handle == NULL) return -1;
+    const doc_inner_t* inner = (const doc_inner_t*)doc->_handle;
     PDF_LOCK();
-    int count = FPDF_GetPageCount((FPDF_DOCUMENT)doc->_handle);
+    int count = poppler_document_get_n_pages(inner->doc);
     PDF_UNLOCK();
     return count;
 }
 
 /* -------------------------------------------------------------------------
- * Metadata
+ * Metadata (poppler returns UTF-8 directly — no iconv needed)
  * ---------------------------------------------------------------------- */
 
-static const char* meta_key(pdf_meta_field_t field) {
-    switch (field) {
-        case PDF_META_TITLE:
-            return "Title";
-        case PDF_META_AUTHOR:
-            return "Author";
-        case PDF_META_SUBJECT:
-            return "Subject";
-        case PDF_META_KEYWORDS:
-            return "Keywords";
-        case PDF_META_CREATOR:
-            return "Creator";
-        case PDF_META_PRODUCER:
-            return "Producer";
-        default:
-            return "Title";
-    }
-}
-
-pdf_status_t pdf_document_metadata(const pdf_document_t* doc, pdf_meta_field_t field, char* buf, size_t bufsz) {
-    if (doc == NULL || buf == NULL || bufsz == 0) return PDF_ERR_PARAM;
-
-    const char* key = meta_key(field);
-
-    PDF_LOCK();
-    unsigned long utf16_bytes = FPDF_GetMetaText((FPDF_DOCUMENT)doc->_handle, key, NULL, 0);
-    if (utf16_bytes <= 2) {
+static pdf_status_t copy_meta_string(const char* src, char* buf, size_t bufsz) {
+    if (src == NULL) {
         buf[0] = '\0';
-        PDF_UNLOCK();
         return PDF_OK;
     }
-
-    /*
-     * Stack-allocate for typical metadata strings (<= 512 UTF-16 chars).
-     * Heap-fallback for unusual cases.
-     */
-    uint16_t stack_u16[512];
-    uint16_t* utf16 = NULL;
-    bool heap = (utf16_bytes > sizeof(stack_u16));
-
-    if (heap) {
-        utf16 = malloc(utf16_bytes);
-        if (utf16 == NULL) {
-            PDF_UNLOCK();
-            return PDF_ERR_NOMEM;
-        }
-    } else {
-        utf16 = stack_u16;
+    size_t len = strlen(src);
+    if (len + 1 <= bufsz) {
+        memcpy(buf, src, len + 1);
+        return PDF_OK;
     }
+    /* Truncate at a UTF-8 character boundary. */
+    size_t n = bufsz - 1;
+    while (n > 0 && ((unsigned char)src[n] & 0xC0) == 0x80) n--;
+    memcpy(buf, src, n);
+    buf[n] = '\0';
+    return PDF_ERR_TRUNC;
+}
 
-    FPDF_GetMetaText((FPDF_DOCUMENT)doc->_handle, key, utf16, utf16_bytes);
+pdf_status_t pdf_document_metadata(const pdf_document_t* doc, pdf_meta_field_t field, char* buf,
+                                   size_t bufsz) {
+    if (doc == NULL || doc->_handle == NULL || buf == NULL || bufsz == 0) return PDF_ERR_PARAM;
+
+    const doc_inner_t* inner = (const doc_inner_t*)doc->_handle;
+    gchar* val = NULL;
+
+    PDF_LOCK();
+    switch (field) {
+        case PDF_META_TITLE:
+            val = poppler_document_get_title(inner->doc);
+            break;
+        case PDF_META_AUTHOR:
+            val = poppler_document_get_author(inner->doc);
+            break;
+        case PDF_META_SUBJECT:
+            val = poppler_document_get_subject(inner->doc);
+            break;
+        case PDF_META_KEYWORDS:
+            val = poppler_document_get_keywords(inner->doc);
+            break;
+        case PDF_META_CREATOR:
+            val = poppler_document_get_creator(inner->doc);
+            break;
+        case PDF_META_PRODUCER:
+            val = poppler_document_get_producer(inner->doc);
+            break;
+        default:
+            val = poppler_document_get_title(inner->doc);
+            break;
+    }
     PDF_UNLOCK();
 
-    iconv_t cd = get_iconv_cd();
-    if (cd == (iconv_t)-1) {
-        if (heap) free(utf16);
-        return PDF_ERR_UNKNOWN;
-    }
-
-    /* Reset iconv state before use. */
-    iconv(cd, NULL, NULL, NULL, NULL);
-
-    char* inbuf = (char*)utf16;
-    size_t inleft = utf16_bytes - 2; /* exclude UTF-16 NUL */
-    char* outbuf = buf;
-    size_t outleft = bufsz - 1;
-
-    pdf_status_t ret = PDF_OK;
-    size_t rc = iconv(cd, &inbuf, &inleft, &outbuf, &outleft);
-    if (rc == (size_t)-1 && errno == E2BIG) {
-        ret = PDF_ERR_TRUNC;
-    } else if (rc == (size_t)-1) {
-        buf[0] = '\0';
-        ret = PDF_ERR_UNKNOWN;
-    }
-
-    *outbuf = '\0';
-    if (heap) free(utf16);
+    pdf_status_t ret = copy_meta_string(val, buf, bufsz);
+    g_free(val);
     return ret;
 }
 
 /* -------------------------------------------------------------------------
- * Page — zero-allocation (stack-friendly) API
+ * Page
  * ---------------------------------------------------------------------- */
 
-static pdf_status_t pdf_page_init(pdf_document_t* doc, int page_index, pdf_page_t* page) {
+pdf_status_t pdf_page_open(pdf_document_t* doc, int page_index, pdf_page_t* page) {
+    if (doc == NULL || doc->_handle == NULL || page == NULL || page_index < 0) return PDF_ERR_PARAM;
+
+    doc_inner_t* inner = (doc_inner_t*)doc->_handle;
     PDF_LOCK();
-    FPDF_PAGE raw = FPDF_LoadPage((FPDF_DOCUMENT)doc->_handle, page_index);
-    if (raw == NULL) {
+    int n = poppler_document_get_n_pages(inner->doc);
+    if (page_index >= n) {
         PDF_UNLOCK();
-        fprintf(stderr, "pdf_page_init: failed to load page %d\n", page_index);
+        fprintf(stderr, "pdf_page_open: page %d out of range (n=%d)\n", page_index, n);
         return PDF_ERR_PAGE;
     }
+    PopplerPage* raw = poppler_document_get_page(inner->doc, page_index);
     PDF_UNLOCK();
 
+    if (raw == NULL) {
+        fprintf(stderr, "pdf_page_open: failed to load page %d\n", page_index);
+        return PDF_ERR_PAGE;
+    }
     page->_handle = raw;
     return PDF_OK;
 }
 
-void pdf_page_destroy(pdf_page_t* page) {
+void pdf_page_close(pdf_page_t* page) {
     if (page == NULL || page->_handle == NULL) return;
     PDF_LOCK();
-    FPDF_ClosePage((FPDF_PAGE)page->_handle);
+    g_object_unref((PopplerPage*)page->_handle);
     PDF_UNLOCK();
     page->_handle = NULL;
 }
 
-/* -------------------------------------------------------------------------
- * Page — heap-allocation (legacy / pointer) API
- * ---------------------------------------------------------------------- */
-
-pdf_status_t pdf_page_open(pdf_document_t* doc, int page_index, pdf_page_t* page) {
-    if (doc == NULL || page == NULL || page_index < 0) return PDF_ERR_PARAM;
-
-    return pdf_page_init(doc, page_index, page);
+static double page_width_locked(PopplerPage* p) {
+    double w = 0.0, h = 0.0;
+    poppler_page_get_size(p, &w, &h);
+    return w;
 }
 
-void pdf_page_close(pdf_page_t* page) {
-    if (page == NULL) return;
-    pdf_page_destroy(page);
+static double page_height_locked(PopplerPage* p) {
+    double w = 0.0, h = 0.0;
+    poppler_page_get_size(p, &w, &h);
+    return h;
 }
 
 float pdf_page_width(const pdf_page_t* page) {
     if (page == NULL || page->_handle == NULL) return 0.0f;
     PDF_LOCK();
-    float v = FPDF_GetPageWidthF((FPDF_PAGE)page->_handle);
+    double v = page_width_locked((PopplerPage*)page->_handle);
     PDF_UNLOCK();
-    return v;
+    return (float)v;
 }
 
 float pdf_page_height(const pdf_page_t* page) {
     if (page == NULL || page->_handle == NULL) return 0.0f;
     PDF_LOCK();
-    float v = FPDF_GetPageHeightF((FPDF_PAGE)page->_handle);
+    double v = page_height_locked((PopplerPage*)page->_handle);
     PDF_UNLOCK();
-    return v;
+    return (float)v;
 }
 
 /* -------------------------------------------------------------------------
- * Rendering
+ * Rendering (poppler → cairo ARGB32 → RGBA)
  * ---------------------------------------------------------------------- */
 
 pdf_status_t pdf_page_render(const pdf_page_t* page, float scale, pdf_bitmap_t* bmp) {
     if (page == NULL || page->_handle == NULL || bmp == NULL || scale <= 0.0f) return PDF_ERR_PARAM;
 
     PDF_LOCK();
-    int w = (int)(FPDF_GetPageWidthF((FPDF_PAGE)page->_handle) * scale);
-    int h = (int)(FPDF_GetPageHeightF((FPDF_PAGE)page->_handle) * scale);
+    double pw = 0.0, ph = 0.0;
+    poppler_page_get_size((PopplerPage*)page->_handle, &pw, &ph);
+    int w = (int)(pw * (double)scale);
+    int h = (int)(ph * (double)scale);
 
     if (w <= 0 || h <= 0) {
         PDF_UNLOCK();
@@ -378,83 +391,194 @@ pdf_status_t pdf_page_render(const pdf_page_t* page, float scale, pdf_bitmap_t* 
         return PDF_ERR_RENDER;
     }
 
-    FPDF_BITMAP fb = FPDFBitmap_Create(w, h, 1 /* has_alpha */);
-    if (fb == NULL) {
+    cairo_surface_t* surf = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, w, h);
+    if (cairo_surface_status(surf) != CAIRO_STATUS_SUCCESS) {
+        PDF_UNLOCK();
+        cairo_surface_destroy(surf);
+        return PDF_ERR_RENDER;
+    }
+
+    cairo_t* cr = cairo_create(surf);
+    if (cairo_status(cr) != CAIRO_STATUS_SUCCESS) {
+        cairo_destroy(cr);
+        cairo_surface_destroy(surf);
         PDF_UNLOCK();
         return PDF_ERR_RENDER;
     }
 
-    FPDFBitmap_FillRect(fb, 0, 0, w, h, 0xFFFFFFFF);
-    FPDF_RenderPageBitmap(fb, (FPDF_PAGE)page->_handle, 0, 0, w, h, 0, FPDF_ANNOT);
+    /* White background . */
+    cairo_set_source_rgb(cr, 1.0, 1.0, 1.0);
+    cairo_paint(cr);
+    cairo_scale(cr, (double)scale, (double)scale);
+    poppler_page_render((PopplerPage*)page->_handle, cr);
 
-    int stride = FPDFBitmap_GetStride(fb);
-    void* src_pixels = FPDFBitmap_GetBuffer(fb);
+    cairo_status_t cs = cairo_status(cr);
+    cairo_destroy(cr);
+    if (cs != CAIRO_STATUS_SUCCESS) {
+        cairo_surface_destroy(surf);
+        PDF_UNLOCK();
+        return PDF_ERR_RENDER;
+    }
+
+    cairo_surface_flush(surf);
+    int stride = cairo_image_surface_get_stride(surf);
+    unsigned char* src = cairo_image_surface_get_data(surf);
+    if (src == NULL) {
+        cairo_surface_destroy(surf);
+        PDF_UNLOCK();
+        return PDF_ERR_RENDER;
+    }
+
     size_t total = (size_t)stride * (size_t)h;
-
     uint8_t* rgba = malloc(total);
     if (rgba == NULL) {
-        FPDFBitmap_Destroy(fb);
+        cairo_surface_destroy(surf);
         PDF_UNLOCK();
         return PDF_ERR_NOMEM;
     }
 
-    memcpy(rgba, src_pixels, total);
-    FPDFBitmap_Destroy(fb);
-    PDF_UNLOCK();
-
-    /* Swap B↔R channels (PDFium gives BGRA; we expose RGBA). */
+    /*
+     * cairo ARGB32 on little-endian is stored BGRA (premultiplied).
+     * Unpremultiply to straight RGBA. Pages are painted opaque white
+     * first, so alpha is 255 almost everywhere; the generic path below
+     * handles any translucent annotation pixels correctly.
+     */
     for (int row = 0; row < h; row++) {
-        uint8_t* p = rgba + (size_t)row * (size_t)stride;
-        for (int col = 0; col < w; col++, p += 4) {
-            uint8_t tmp = p[0];
-            p[0] = p[2];
-            p[2] = tmp;
+        const unsigned char* s = src + (size_t)row * (size_t)stride;
+        uint8_t* d = rgba + (size_t)row * (size_t)stride;
+        for (int col = 0; col < w; col++, s += 4, d += 4) {
+            unsigned b = s[0], g = s[1], r = s[2], a = s[3];
+            if (a == 255) {
+                d[0] = (uint8_t)r;
+                d[1] = (uint8_t)g;
+                d[2] = (uint8_t)b;
+                d[3] = 255;
+            } else if (a == 0) {
+                d[0] = d[1] = d[2] = 255;
+                d[3] = 255;
+            } else {
+                /* Unpremultiply with rounding; composite over white. */
+                unsigned rr = (r * 255 + a / 2) / a;
+                unsigned gg = (g * 255 + a / 2) / a;
+                unsigned bb = (b * 255 + a / 2) / a;
+                if (rr > 255) rr = 255;
+                if (gg > 255) gg = 255;
+                if (bb > 255) bb = 255;
+                d[0] = (uint8_t)rr;
+                d[1] = (uint8_t)gg;
+                d[2] = (uint8_t)bb;
+                d[3] = 255;
+            }
         }
     }
+
+    cairo_surface_destroy(surf);
+    PDF_UNLOCK();
 
     *bmp = (pdf_bitmap_t){.pixels = rgba, .width = w, .height = h, .stride = stride};
     return PDF_OK;
 }
 
 /* -------------------------------------------------------------------------
- * Text extraction — zero-allocation (stack-friendly) API
+ * Text extraction (snapshot at init; lock-free afterwards)
  * ---------------------------------------------------------------------- */
 
 pdf_status_t pdf_text_init(pdf_page_t* page, pdf_text_t* text) {
     if (page == NULL || page->_handle == NULL || text == NULL) return PDF_ERR_PARAM;
 
     PDF_LOCK();
-    FPDF_TEXTPAGE raw = FPDFText_LoadPage((FPDF_PAGE)page->_handle);
-    if (raw == NULL) {
-        PDF_UNLOCK();
-        fprintf(stderr, "pdf_text_init: FPDFText_LoadPage failed\n");
-        return PDF_ERR_TEXT;
-    }
-    text->count = FPDFText_CountChars(raw);
+    PopplerPage* p = (PopplerPage*)page->_handle;
+    double w = 0.0, page_h = 0.0;
+    poppler_page_get_size(p, &w, &page_h);
+    char* raw_text = poppler_page_get_text(p);
+    PopplerRectangle* rects = NULL;
+    guint n_rects = 0;
+    /* Layout failure is non-fatal — we fall back to degenerate boxes. */
+    (void)poppler_page_get_text_layout(p, &rects, &n_rects);
     PDF_UNLOCK();
 
-    text->_handle = raw;
+    if (raw_text == NULL) {
+        /* Treat as empty page rather than a hard failure. */
+        raw_text = g_strdup("");
+        if (raw_text == NULL) {
+            g_free(rects);
+            return PDF_ERR_NOMEM;
+        }
+    }
+
+    long nchars = g_utf8_strlen(raw_text, -1);
+    if (nchars < 0) nchars = 0;
+
+    text_inner_t* inner = malloc(sizeof(*inner));
+    if (inner == NULL) {
+        g_free(raw_text);
+        g_free(rects);
+        return PDF_ERR_NOMEM;
+    }
+    inner->utf8 = raw_text; /* adopt */
+    inner->count = (int)nchars;
+    inner->boxes = NULL;
+
+    if (nchars > 0) {
+        inner->boxes = malloc((size_t)nchars * sizeof(*inner->boxes));
+        if (inner->boxes == NULL) {
+            g_free(raw_text);
+            g_free(rects);
+            free(inner);
+            return PDF_ERR_NOMEM;
+        }
+        bool layout_ok = (rects != NULL && n_rects == (guint)nchars);
+        /* Walk the UTF-8 sequentially (O(n)); g_utf8_offset_to_pointer()
+         * per index would be O(n^2) and dominate on dense pages. */
+        const char* ptr = raw_text;
+        for (long i = 0; i < nchars; i++) {
+            gunichar ch = g_utf8_get_char(ptr);
+            if (!layout_ok) {
+                inner->boxes[i] = (pdf_char_box_t){.left = 0,
+                                                   .right = 0,
+                                                   .bottom = 0,
+                                                   .top = 0,
+                                                   .codepoint = (uint32_t)ch};
+            } else {
+                /* Poppler rects use a top-left origin; flip Y to the
+                 * public bottom-left-origin contract. */
+                float left = (float)rects[i].x1;
+                float right = (float)rects[i].x2;
+                float bottom = (float)(page_h - rects[i].y2);
+                float top = (float)(page_h - rects[i].y1);
+                inner->boxes[i] = (pdf_char_box_t){.left = left,
+                                                   .right = right,
+                                                   .bottom = bottom,
+                                                   .top = top,
+                                                   .codepoint = (uint32_t)ch};
+            }
+            ptr = g_utf8_next_char(ptr);
+        }
+    }
+    g_free(rects);
+
+    text->_handle = inner;
+    text->count = inner->count;
     return PDF_OK;
 }
 
 void pdf_text_destroy(pdf_text_t* text) {
     if (text == NULL || text->_handle == NULL) return;
-    PDF_LOCK();
-    FPDFText_ClosePage((FPDF_TEXTPAGE)text->_handle);
-    PDF_UNLOCK();
+    text_inner_t* inner = (text_inner_t*)text->_handle;
+    g_free(inner->utf8);
+    free(inner->boxes);
+    free(inner);
     text->_handle = NULL;
     text->count = 0;
 }
-
-/* -------------------------------------------------------------------------
- * Text extraction — heap-allocation (legacy / pointer) API
- * ---------------------------------------------------------------------- */
 
 pdf_status_t pdf_text_open(pdf_page_t* page, pdf_text_t** out) {
     if (page == NULL || out == NULL) return PDF_ERR_PARAM;
 
     pdf_text_t* text = malloc(sizeof(*text));
     if (text == NULL) return PDF_ERR_NOMEM;
+    text->_handle = NULL;
+    text->count = 0;
 
     pdf_status_t st = pdf_text_init(page, text);
     if (st != PDF_OK) {
@@ -472,177 +596,67 @@ void pdf_text_close(pdf_text_t* text) {
     free(text);
 }
 
-int pdf_text_char_count(const pdf_text_t* text) {
-    return (text != NULL) ? text->count : 0;
-}
+int pdf_text_char_count(const pdf_text_t* text) { return (text != NULL) ? text->count : 0; }
 
-/* -------------------------------------------------------------------------
- * Core UTF-16 → UTF-8 conversion (shared by both text extraction paths).
- *
- * utf16      — input buffer (count UTF-16 code units, no NUL required)
- * char_count — number of code units
- * buf        — destination UTF-8 buffer
- * cap        — capacity of buf (must be >= 1)
- * written    — if non-NULL, receives bytes written (excl. NUL) on PDF_OK
- *
- * Returns PDF_OK, PDF_ERR_TRUNC, or PDF_ERR_UNKNOWN.
- * ---------------------------------------------------------------------- */
-static pdf_status_t convert_utf16_to_utf8(const uint16_t* utf16, int char_count, char* buf, size_t cap,
-                                          size_t* written) {
-    iconv_t cd = get_iconv_cd();
-    if (cd == (iconv_t)-1) {
-        fprintf(stderr, "pdf: iconv_open failed: %s\n", strerror(errno));
-        return PDF_ERR_UNKNOWN;
-    }
-
-    /* Reset iconv shift state before every conversion. */
-    iconv(cd, NULL, NULL, NULL, NULL);
-
-    char* inbuf = (char*)utf16;
-    size_t inleft = (size_t)char_count * sizeof(uint16_t);
-    char* outbuf = buf;
-    size_t outleft = cap - 1; /* reserve one byte for NUL */
-
-    pdf_status_t ret = PDF_OK;
-    size_t rc = iconv(cd, &inbuf, &inleft, &outbuf, &outleft);
-    if (rc == (size_t)-1 && errno == E2BIG) {
-        ret = PDF_ERR_TRUNC;
-    } else if (rc == (size_t)-1) {
-        buf[0] = '\0';
-        return PDF_ERR_UNKNOWN;
-    }
-
-    *outbuf = '\0';
-    if (written) *written = (size_t)(outbuf - buf);
-    return ret;
-}
+/** UTF-8 continuation-byte test (0x80–0xBF). */
+static bool is_utf8_cont(unsigned char c) { return (c & 0xC0) == 0x80; }
 
 pdf_status_t pdf_text_utf8_buf(const pdf_text_t* text, char* buf, size_t cap, size_t* written) {
-    if (text == NULL || buf == NULL || cap == 0) return PDF_ERR_PARAM;
+    if (text == NULL || text->_handle == NULL || buf == NULL || cap == 0) return PDF_ERR_PARAM;
 
-    int char_count = text->count;
-    if (char_count <= 0) {
-        buf[0] = '\0';
-        if (written) *written = 0;
+    const text_inner_t* inner = (const text_inner_t*)text->_handle;
+    size_t len = strlen(inner->utf8);
+    if (len + 1 <= cap) {
+        memcpy(buf, inner->utf8, len + 1);
+        if (written) *written = len;
         return PDF_OK;
     }
-
-    /*
-     * Stack path: char_count <= MAX_UTF16_STACK_CHARS avoids any heap use.
-     * Heap fallback: used only for unusually large pages.
-     */
-    uint16_t stack_buf[MAX_UTF16_STACK_CHARS + 1];
-    uint16_t* utf16 = NULL;
-    bool heap = (char_count > MAX_UTF16_STACK_CHARS);
-
-    if (heap) {
-        utf16 = malloc(((size_t)char_count + 1) * sizeof(uint16_t));
-        if (utf16 == NULL) return PDF_ERR_NOMEM;
-    } else {
-        utf16 = stack_buf;
+    /* Truncate without splitting a UTF-8 sequence. */
+    size_t n = cap - 1;
+    while (n > 0 && is_utf8_cont((unsigned char)inner->utf8[n])) n--;
+    /* If we landed on a lead byte cut off from its continuation, step back. */
+    if (n > 0) {
+        unsigned char c = (unsigned char)inner->utf8[n - 1];
+        size_t need = 0;
+        if ((c & 0xE0) == 0xC0)
+            need = 1;
+        else if ((c & 0xF0) == 0xE0)
+            need = 2;
+        else if ((c & 0xF8) == 0xF0)
+            need = 3;
+        if (need > 0 && (cap - 1 - (n - 1) - 1) < need) n--;
     }
-
-    PDF_LOCK();
-    FPDFText_GetText((FPDF_TEXTPAGE)text->_handle, 0, char_count, utf16);
-    PDF_UNLOCK();
-
-    pdf_status_t ret = convert_utf16_to_utf8(utf16, char_count, buf, cap, written);
-
-    if (heap) free(utf16);
-    return ret;
+    memcpy(buf, inner->utf8, n);
+    buf[n] = '\0';
+    if (written) *written = n;
+    return PDF_ERR_TRUNC;
 }
 
 pdf_status_t pdf_text_utf8(const pdf_text_t* text, char** out) {
-    if (text == NULL || out == NULL) return PDF_ERR_PARAM;
+    if (text == NULL || text->_handle == NULL || out == NULL) return PDF_ERR_PARAM;
 
-    int char_count = text->count;
-    if (char_count <= 0) {
-        char* empty = malloc(1);
-        if (empty == NULL) return PDF_ERR_NOMEM;
-        empty[0] = '\0';
-        *out = empty;
-        return PDF_OK;
-    }
-
-    /* Stack path for the UTF-16 source (same threshold as utf8_buf). */
-    uint16_t stack_buf[MAX_UTF16_STACK_CHARS + 1];
-    uint16_t* utf16 = NULL;
-    bool heap = (char_count > MAX_UTF16_STACK_CHARS);
-
-    if (heap) {
-        utf16 = malloc(((size_t)char_count + 1) * sizeof(uint16_t));
-        if (utf16 == NULL) return PDF_ERR_NOMEM;
-    } else {
-        utf16 = stack_buf;
-    }
-
-    PDF_LOCK();
-    FPDFText_GetText((FPDF_TEXTPAGE)text->_handle, 0, char_count, utf16);
-    PDF_UNLOCK();
-
-    /* Allocate the UTF-8 output buffer (worst case: 3 bytes per char + NUL). */
-    size_t utf8_cap = (size_t)char_count * 3 + 1;
-    char* utf8 = malloc(utf8_cap);
-    if (utf8 == NULL) {
-        if (heap) free(utf16);
-        return PDF_ERR_NOMEM;
-    }
-
-    size_t written = 0;
-    pdf_status_t ret = convert_utf16_to_utf8(utf16, char_count, utf8, utf8_cap, &written);
-    if (heap) free(utf16);
-
-    if (ret != PDF_OK && ret != PDF_ERR_TRUNC) {
-        free(utf8);
-        return ret;
-    }
-
-    /*
-     * Shrink the allocation to the actual used size.  Ignore realloc
-     * failure — the original buffer is still valid and correctly sized.
-     */
-    if (written + 1 < utf8_cap) {
-        char* shrunk = realloc(utf8, written + 1);
-        if (shrunk) utf8 = shrunk;
-    }
-
-    *out = utf8;
-    return PDF_OK; /* callers of the heap API don't need to know about truncation */
+    const text_inner_t* inner = (const text_inner_t*)text->_handle;
+    size_t len = strlen(inner->utf8);
+    char* dup = malloc(len + 1);
+    if (dup == NULL) return PDF_ERR_NOMEM;
+    memcpy(dup, inner->utf8, len + 1);
+    *out = dup;
+    return PDF_OK;
 }
 
-pdf_status_t pdf_text_char_boxes(const pdf_text_t* text, int start_index, int count, pdf_char_box_t* boxes) {
+pdf_status_t pdf_text_char_boxes(const pdf_text_t* text, int start_index, int count,
+                                 pdf_char_box_t* boxes) {
     if (text == NULL || text->_handle == NULL || boxes == NULL) return PDF_ERR_PARAM;
     if (start_index < 0 || count <= 0) return PDF_ERR_PARAM;
-    if (start_index + count > text->count) return PDF_ERR_PARAM;
+    const text_inner_t* inner = (const text_inner_t*)text->_handle;
+    if (start_index + count > inner->count) return PDF_ERR_PARAM;
 
-    FPDF_TEXTPAGE handle = (FPDF_TEXTPAGE)text->_handle;
-
-    PDF_LOCK();
-    for (int i = 0; i < count; i++) {
-        int idx = start_index + i;
-        double left = 0.0, right = 0.0, bottom = 0.0, top = 0.0;
-
-        /* FPDFText_GetCharBox returns 0 on failure; leave a zeroed box
-         * for that character rather than aborting the whole batch, so
-         * one malformed glyph doesn't cost the caller the rest of the
-         * page's layout data. */
-        if (!FPDFText_GetCharBox(handle, idx, &left, &right, &bottom, &top)) { left = right = bottom = top = 0.0; }
-
-        boxes[i] = (pdf_char_box_t){
-            .left = (float)left,
-            .right = (float)right,
-            .bottom = (float)bottom,
-            .top = (float)top,
-            .codepoint = (uint32_t)FPDFText_GetUnicode(handle, idx),
-        };
-    }
-    PDF_UNLOCK();
-
+    memcpy(boxes, inner->boxes + start_index, (size_t)count * sizeof(*boxes));
     return PDF_OK;
 }
 
 /* -------------------------------------------------------------------------
- * Image encoding helpers
+ * Image encoding helpers (unchanged — backend-independent via stb)
  * ---------------------------------------------------------------------- */
 
 /** Converts the RGBA bitmap to a packed RGB buffer. Caller must free(). */
@@ -665,7 +679,8 @@ static uint8_t* rgba_to_rgb(const pdf_bitmap_t* bmp) {
     return rgb;
 }
 
-pdf_status_t pdf_bitmap_write(const pdf_bitmap_t* bmp, const char* path, pdf_image_format_t format, int quality) {
+pdf_status_t pdf_bitmap_write(const pdf_bitmap_t* bmp, const char* path, pdf_image_format_t format,
+                              int quality) {
     if (bmp == NULL || bmp->pixels == NULL || path == NULL) return PDF_ERR_PARAM;
 
     uint8_t* rgb = rgba_to_rgb(bmp);
@@ -709,8 +724,7 @@ static void encode_write_cb(void* context, void* data, int size) {
     size_t needed = ctx->size + (size_t)size;
     if (needed > ctx->capacity) {
         size_t new_cap = ctx->capacity == 0 ? 4096 : ctx->capacity * 2;
-        while (new_cap < needed)
-            new_cap *= 2;
+        while (new_cap < needed) new_cap *= 2;
         uint8_t* next = realloc(ctx->data, new_cap);
         if (next == NULL) {
             ctx->status = PDF_ERR_NOMEM;
@@ -723,9 +737,10 @@ static void encode_write_cb(void* context, void* data, int size) {
     ctx->size = needed;
 }
 
-pdf_status_t pdf_bitmap_encode(const pdf_bitmap_t* bmp, pdf_image_format_t format, int quality, uint8_t** out_data,
-                               size_t* out_size) {
-    if (bmp == NULL || bmp->pixels == NULL || out_data == NULL || out_size == NULL) return PDF_ERR_PARAM;
+pdf_status_t pdf_bitmap_encode(const pdf_bitmap_t* bmp, pdf_image_format_t format, int quality,
+                               uint8_t** out_data, size_t* out_size) {
+    if (bmp == NULL || bmp->pixels == NULL || out_data == NULL || out_size == NULL)
+        return PDF_ERR_PARAM;
 
     uint8_t* rgb = rgba_to_rgb(bmp);
     if (rgb == NULL) return PDF_ERR_NOMEM;
@@ -736,11 +751,13 @@ pdf_status_t pdf_bitmap_encode(const pdf_bitmap_t* bmp, pdf_image_format_t forma
 
     switch (format) {
         case PDF_IMAGE_PNG:
-            rc = stbi_write_png_to_func(encode_write_cb, &ctx, bmp->width, bmp->height, 3, rgb, stride_rgb);
+            rc = stbi_write_png_to_func(encode_write_cb, &ctx, bmp->width, bmp->height, 3, rgb,
+                                        stride_rgb);
             break;
         case PDF_IMAGE_JPEG:
             quality = (quality <= 0 || quality > 100) ? 88 : quality;
-            rc = stbi_write_jpg_to_func(encode_write_cb, &ctx, bmp->width, bmp->height, 3, rgb, quality);
+            rc = stbi_write_jpg_to_func(encode_write_cb, &ctx, bmp->width, bmp->height, 3, rgb,
+                                        quality);
             break;
         default:
             free(rgb);

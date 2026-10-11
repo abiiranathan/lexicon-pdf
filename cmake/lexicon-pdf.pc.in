@@ -7,12 +7,13 @@ Name:        @PROJECT_NAME@
 Description: @PROJECT_DESCRIPTION@
 Version:     @PROJECT_VERSION@
 URL:         @PROJECT_HOMEPAGE_URL@
+Requires:    poppler-glib
 
 # The public header lives under $includedir/lexicon/
 Cflags:      -I${includedir}
 
-# lexicon-pdf itself; pdfium is a private implementation detail and does
-# not need to appear on the consumer's link line when using the shared lib.
-# For static builds the consumer must also link pdfium explicitly.
-Libs:        -L${libdir} -llexicon-pdf -lvfs
-Libs.private: -l@PDFIUM_LIB_NAME@
+# lexicon-pdf itself; poppler-glib is a private implementation detail and
+# does not need to appear on the consumer's link line when using the shared
+# lib. For static builds the consumer must also link poppler-glib explicitly.
+Libs:        -L${libdir} -llexicon-pdf
+Libs.private: -lpoppler-glib -lgobject-2.0 -lglib-2.0 -lcairo
